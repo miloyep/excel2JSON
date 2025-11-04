@@ -4,13 +4,25 @@ on:
   push:
     branches: [ main ]
   pull_request:
-  workflow_dispatch:
+  workflow_dispatch: # 手动触发
 
 jobs:
   build:
     strategy:
       matrix:
-        platform: [macos-latest, ubuntu-latest, windows-latest]
+        include:
+          # 🧱 macOS (Intel)
+          - platform: macos-latest
+            target: x86_64-apple-darwin
+          # 🍎 macOS (Apple Silicon)
+          - platform: macos-latest
+            target: aarch64-apple-darwin
+          # 🐧 Linux
+          - platform: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          # 🪟 Windows
+          - platform: windows-latest
+            target: x86_64-pc-windows-msvc
 
     runs-on: ${{ matrix.platform }}
 
@@ -20,6 +32,8 @@ jobs:
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -32,6 +46,7 @@ jobs:
       - name: Install dependencies
         run: pnpm install
 
+      # Linux 构建需要 GTK + WebKit2 支持
       - name: Install Linux build dependencies
         if: matrix.platform == 'ubuntu-latest'
         run: |
@@ -40,43 +55,15 @@ jobs:
             libgtk-3-dev libwebkit2gtk-4.1-dev \
             build-essential curl wget libayatana-appindicator3-dev librsvg2-dev
 
-      # ✅ macOS: build both arm64 + x86_64, then merge
-      - name: Build macOS universal binary
-        if: matrix.platform == 'macos-latest'
-        run: |
-          rustup target add aarch64-apple-darwin
-          rustup target add x86_64-apple-darwin
-
-          echo "🔨 Building for Apple Silicon (arm64)..."
-          pnpm tauri build --target aarch64-apple-darwin
-
-          echo "🔨 Building for Intel (x64)..."
-          pnpm tauri build --target x86_64-apple-darwin
-
-          echo "🧩 Combining into Universal Binary..."
-          APP_NAME=$(jq -r '.productName' src-tauri/tauri.conf.json)
-          ARM_APP="src-tauri/target/aarch64-apple-darwin/release/bundle/macos/${APP_NAME}.app"
-          X64_APP="src-tauri/target/x86_64-apple-darwin/release/bundle/macos/${APP_NAME}.app"
-          UNIVERSAL_APP="src-tauri/target/universal/release/bundle/macos/${APP_NAME}.app"
-
-          mkdir -p "$(dirname "$UNIVERSAL_APP")"
-          ditto "$ARM_APP" "$UNIVERSAL_APP"
-
-          # 合并二进制
-          lipo -create \
-            "$ARM_APP/Contents/MacOS/${APP_NAME}" \
-            "$X64_APP/Contents/MacOS/${APP_NAME}" \
-            -output "$UNIVERSAL_APP/Contents/MacOS/${APP_NAME}"
-
-          echo "✅ Universal binary created at: $UNIVERSAL_APP"
-
-      # Windows / Linux 正常构建
       - name: Build Tauri app
-        if: matrix.platform != 'macos-latest'
-        run: pnpm tauri build
+        env:
+          RUSTFLAGS: "-C target-cpu=native"
+          TAURI_BUILD_TARGET: ${{ matrix.target }}
+        run: |
+          pnpm tauri build --target ${{ matrix.target }}
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.platform }}-build
-          path: src-tauri/target/
+          name: ${{ matrix.platform }}-${{ matrix.target }}-build
+          path: src-tauri/target/${{ matrix.target }}/release/bundle/
