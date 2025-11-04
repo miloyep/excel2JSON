@@ -2,6 +2,7 @@ import { useEffect, useState, useRef } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import packageJson from "../package.json";
 import "./App.css";
 
 function App() {
@@ -104,7 +105,7 @@ function App() {
           fontFamily: "monospace",
         }}
       >
-        v1.0.1
+        v{packageJson.version}
       </p>
     </main>
   );

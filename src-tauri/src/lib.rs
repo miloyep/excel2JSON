@@ -1,8 +1,12 @@
-use calamine::{open_workbook, Reader, Xlsx};
-use chrono::Local;
+use calamine::{open_workbook, DataType, Reader, Xlsx};
+use chrono::{Duration as ChronoDuration, Local, NaiveDate};
+use indexmap::IndexMap;
+use json::JsonValue;
 use serde::Serialize;
-use serde_json::json;
+use serde_json::{json, Value};
 use std::fs;
+use std::io::BufReader;
+use std::path::{Path, PathBuf};
 use tauri::{AppHandle, Emitter};
 
 /// 日志类型
@@ -46,126 +50,307 @@ fn check_placeholders(value: &str) -> Result<(), String> {
     Ok(())
 }
 
+// 配置结构体
+#[derive(Debug, Clone)]
+struct SheetConfig {
+    name: String,
+    sheet_type: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct LanguageConfig {
+    code: String,
+}
+
+// 从 Excel 读取语言配置
+fn read_language_configs_from_excel(
+    workbook: &mut Xlsx<BufReader<fs::File>>,
+) -> Result<Vec<LanguageConfig>, Box<dyn std::error::Error>> {
+    let sheet_name = "导出语言管理";
+    let range = workbook
+        .worksheet_range(sheet_name)
+        .ok_or_else(|| format!("未找到工作表: {}", sheet_name))??;
+
+    let mut configs = Vec::new();
+
+    for row in range.rows() {
+        if !row.is_empty() {
+            let lang_code = get_cell_string(&row[0]);
+            if !lang_code.is_empty() {
+                configs.push(LanguageConfig { code: lang_code });
+            }
+        }
+    }
+
+    Ok(configs)
+}
+
+fn read_sheet_configs_from_excel(
+    app: &AppHandle,
+    workbook: &mut Xlsx<BufReader<fs::File>>,
+) -> Result<Vec<SheetConfig>, Box<dyn std::error::Error>> {
+    let sheet_name = "导出sheet管理";
+    let range = workbook
+        .worksheet_range(sheet_name)
+        .ok_or_else(|| format!("未找到工作表: {}", sheet_name))??;
+
+    let mut configs = Vec::new();
+
+    for row in range.rows() {
+        if row.len() < 1 {
+            continue;
+        }
+
+        let name = get_cell_string(&row[0]);
+        let sheet_type = if row.len() > 1 {
+            let s = get_cell_string(&row[1]);
+            if s.trim().is_empty() {
+                None
+            } else {
+                Some(s)
+            }
+        } else {
+            None
+        };
+
+        configs.push(SheetConfig { name, sheet_type });
+    }
+
+    Ok(configs)
+}
+
+fn get_cell_string(cell: &DataType) -> String {
+    match cell {
+        DataType::String(s) => s.to_string(),
+        DataType::Float(f) => {
+            if *f > 30000.0 && *f < 70000.0 {
+                let base_date = NaiveDate::from_ymd_opt(1899, 12, 30).unwrap();
+                let date = base_date + ChronoDuration::days(*f as i64);
+                date.format("%Y-%m-%d").to_string()
+            } else if f.fract() == 0.0 {
+                format!("{:.0}", f)
+            } else {
+                f.to_string()
+            }
+        }
+        DataType::Int(i) => i.to_string(),
+        DataType::Bool(b) => b.to_string(),
+        DataType::DateTime(dt) => {
+            let base_date = NaiveDate::from_ymd_opt(1899, 12, 30).unwrap();
+            let days = dt.trunc() as i64;
+            let seconds = ((*dt - dt.trunc()) * 86400.0) as i64;
+            let datetime = base_date.and_hms_opt(0, 0, 0).unwrap()
+                + ChronoDuration::days(days)
+                + ChronoDuration::seconds(seconds);
+            datetime.format("%Y-%m-%d %H:%M:%S").to_string()
+        }
+        DataType::Duration(d) => {
+            let total_seconds = (*d * 86400.0) as i64;
+            let hours = total_seconds / 3600;
+            let minutes = (total_seconds % 3600) / 60;
+            let seconds = total_seconds % 60;
+            format!("{:02}:{:02}:{:02}", hours, minutes, seconds)
+        }
+        DataType::DateTimeIso(s) => s.clone(),
+        DataType::DurationIso(s) => s.clone(),
+        DataType::Error(e) => format!("Error: {:?}", e),
+        DataType::Empty => String::new(),
+    }
+}
+
 #[tauri::command]
 async fn convert_excel_to_json(app: AppHandle, path: String) -> Result<String, String> {
     send_progress(&app, &format!("开始处理文件: {}", path), LogType::Info)?;
 
-    let file_path = std::path::PathBuf::from(&path);
+    let file_path = PathBuf::from(&path);
+    if !file_path.exists() {
+        let msg = format!("文件不存在: {}", file_path.display());
+        send_progress(&app, &msg, LogType::Error)?;
+        return Err(msg);
+    }
+
+    send_progress(&app, "正在打开 Excel 文件...", LogType::Info)?;
     let mut workbook: Xlsx<_> =
         open_workbook(&file_path).map_err(|e| format!("打开文件失败: {}", e))?;
+    send_progress(&app, "Excel 文件已成功打开", LogType::Success)?;
 
-    let sheet_lang_name = "导出语言管理";
-    let sheet_obj_name = "导出sheet管理";
+    // 读取语言和 sheet 配置
+    let lang_configs = read_language_configs_from_excel(&mut workbook)
+        .map_err(|e| format!("读取语言配置失败: {}", e))?;
+    let sheet_configs =
+        read_sheet_configs_from_excel(&app, &mut workbook).map_err(|e| e.to_string())?;
 
-    let data_lang = workbook
-        .worksheet_range(sheet_lang_name)
-        .ok_or("找不到 Sheet: 导出语言管理")?
-        .map_err(|_| "读取 sheet_lang 失败")?;
+    send_progress(
+        &app,
+        &format!(
+            "读取到 {} 个语言, {} 个工作表",
+            lang_configs.len(),
+            sheet_configs.len()
+        ),
+        LogType::Info,
+    )?;
 
-    let data_obj = workbook
-        .worksheet_range(sheet_obj_name)
-        .ok_or("找不到 Sheet: 导出sheet管理")?
-        .map_err(|_| "读取 sheet_obj 失败")?;
+    // 创建导出目录
+    let parent = file_path.parent().unwrap_or_else(|| Path::new("."));
+    let stem = file_path
+        .file_stem()
+        .map(|s| s.to_string_lossy())
+        .unwrap_or_else(|| "export".into());
+    let time_str = Local::now().format("%Y%m%d_%H%M%S").to_string();
+    let export_folder_name = format!("{}_{}", stem, time_str);
+    let output_dir = parent.join(&export_folder_name);
+    fs::create_dir_all(&output_dir).map_err(|e| format!("创建目录失败: {}", e))?;
 
-    let parent = file_path.parent().unwrap_or(std::path::Path::new("."));
-    let folder_name = format!(
-        "{}_{}",
-        file_path.file_stem().unwrap().to_string_lossy(),
-        Local::now().format("%Y%m%d_%H%M%S")
-    );
-    let output_dir = parent.join(&folder_name);
-
-    fs::create_dir_all(&output_dir).map_err(|e| e.to_string())?;
+    send_progress(
+        &app,
+        &format!("导出文件夹创建完成: {}", output_dir.display()),
+        LogType::Success,
+    )?;
 
     let mut all_jsons = vec![];
 
-    for row_lang in data_lang.rows() {
-        let lang = row_lang[0].to_string();
-        let mut obj = serde_json::Map::new();
+    for lang_config in &lang_configs {
+        send_progress(
+            &app,
+            &format!("正在处理语言: {}", lang_config.code),
+            LogType::Info,
+        )?;
 
-        send_progress(&app, &format!("正在处理语言: {}", lang), LogType::Info)?;
+        // 存储每个 sheet 的数据
+        let mut sheet_data_map: IndexMap<String, IndexMap<String, String>> = IndexMap::new();
 
-        for row_obj in data_obj.rows() {
-            let sheet_name = row_obj[0].to_string();
-            let sheet_type = row_obj[1].to_string();
-
-            let range = workbook
-                .worksheet_range(&sheet_name)
-                .ok_or(format!("找不到 Sheet: {}", sheet_name))?
-                .map_err(|_| "读取 sheet 失败")?;
-
-            // 找到对应语言列
-            let mut col_of_lang = None;
-            if let Some(header_row) = range.rows().next() {
-                for (i, cell) in header_row.iter().enumerate() {
-                    if cell.to_string() == lang {
-                        col_of_lang = Some(i);
-                    }
+        for sheet_config in &sheet_configs {
+            let range = match workbook.worksheet_range(&sheet_config.name) {
+                Some(Ok(r)) => r,
+                Some(Err(e)) => {
+                    send_progress(
+                        &app,
+                        &format!("⚠️ 读取工作表 {} 失败: {}", sheet_config.name, e),
+                        LogType::Warning,
+                    )?;
+                    continue;
                 }
-            }
-            let col_of_lang = match col_of_lang {
-                Some(c) => c,
-                None => continue,
+                None => {
+                    send_progress(
+                        &app,
+                        &format!("⚠️ 找不到工作表: {}", sheet_config.name),
+                        LogType::Warning,
+                    )?;
+                    continue;
+                }
             };
 
-            let mut temp = serde_json::Map::new();
+            let header_row = match range.rows().next() {
+                Some(h) => h,
+                None => {
+                    send_progress(
+                        &app,
+                        &format!("⚠️ 工作表 '{}' 没有表头，跳过", sheet_config.name),
+                        LogType::Warning,
+                    )?;
+                    continue;
+                }
+            };
 
-            for (row_idx, row) in range.rows().skip(1).enumerate() {
-                let key = row[0].to_string();
-                let value = row[col_of_lang].to_string();
+            let lang_col = header_row
+                .iter()
+                .position(|c| get_cell_string(c) == lang_config.code);
+            let lang_col = match lang_col {
+                Some(c) => c,
+                None => {
+                    send_progress(
+                        &app,
+                        &format!(
+                            "⚠️ 工作表 '{}' 未找到语言列: {}",
+                            sheet_config.name, lang_config.code
+                        ),
+                        LogType::Warning,
+                    )?;
+                    continue;
+                }
+            };
 
-                // 空值检查
-                if value.trim().is_empty() {
-                    let _ = send_progress(
+            let mut temp: IndexMap<String, String> = IndexMap::new();
+
+            for (row_idx, row) in range.rows().enumerate().skip(1) {
+                let key = get_cell_string(&row[0]); // 保留原始 key
+                if key.is_empty() {
+                    continue;
+                }
+
+                let value = if row.len() > lang_col {
+                    get_cell_string(&row[lang_col]) // 保留原始值，包括空格
+                } else {
+                    String::new()
+                };
+
+                // 空值警告
+                if value.is_empty() {
+                    send_progress(
                         &app,
                         &format!(
                             "空值警告 Sheet: '{}' 行: {} 列: '{}' Key: '{}'",
-                            sheet_name,
-                            row_idx + 2,
-                            lang,
+                            sheet_config.name,
+                            row_idx + 1,
+                            lang_config.code,
                             key
                         ),
                         LogType::Warning,
-                    );
+                    )?;
                 }
 
-                // 占位符校验
                 if let Err(err) = check_placeholders(&value) {
-                    let _ = fs::remove_dir_all(&output_dir);
-                    return Err(format!(
-                        "占位符校验失败 Sheet: '{}' 行: {} 列: '{}' Key: '{}' 值: '{}', 错误: {}",
-                        sheet_name,
-                        row_idx + 2,
-                        lang,
+                    let msg = format!(
+                        "占位符校验失败 Sheet: '{}' 行: {} Key: '{}' 值: '{}' 错误: {}",
+                        sheet_config.name,
+                        row_idx + 1,
                         key,
                         value,
                         err
-                    ));
+                    );
+                    let _ = fs::remove_dir_all(&output_dir);
+                    return Err(msg);
                 }
 
-                if sheet_type == "root" {
-                    obj.insert(key, json!(value));
-                } else {
-                    temp.insert(key, json!(value));
-                }
+                temp.insert(key, value);
             }
 
-            if sheet_type != "root" {
-                obj.insert(sheet_name, json!(temp));
+            sheet_data_map.insert(sheet_config.name.clone(), temp);
+        }
+
+        // 合并 sheet 数据到最终 JSON
+        let mut final_json = JsonValue::new_object();
+
+        for sheet_config in &sheet_configs {
+            if let Some(temp) = sheet_data_map.get(&sheet_config.name) {
+                if sheet_config.sheet_type.as_deref() == Some("root") {
+                    // root sheet 平铺 key
+                    for (k, v) in temp {
+                        final_json[k] = v.clone().into();
+                    }
+                } else {
+                    // 非 root sheet 保留 sheet 名称一级 key，保持 temp 顺序
+                    let mut sheet_obj = JsonValue::new_object();
+                    for (k, v) in temp {
+                        sheet_obj[k] = v.clone().into();
+                    }
+                    final_json[sheet_config.name.clone()] = sheet_obj;
+                }
             }
         }
 
-        let json_str = serde_json::to_string_pretty(&obj).unwrap();
-        let output_path = output_dir.join(format!("{}.json", lang));
-        fs::write(&output_path, &json_str).map_err(|e| e.to_string())?;
-
-        all_jsons.push(output_path.clone());
+        // 写入 JSON 文件（漂亮缩进）
+        let json_str = final_json.pretty(2); // 两个空格缩进
+        let output_path = output_dir.join(format!("{}.json", lang_config.code));
+        fs::write(&output_path, json_str).map_err(|e| e.to_string())?;
 
         send_progress(
             &app,
-            &format!("已导出语言文件: {:?}", output_path),
+            &format!("✅ 已导出语言文件: {}", output_path.display()),
             LogType::Success,
         )?;
+
+        all_jsons.push(output_path);
     }
 
     send_progress(
@@ -175,7 +360,7 @@ async fn convert_excel_to_json(app: AppHandle, path: String) -> Result<String, S
     )?;
 
     Ok(format!(
-        "已导出 {} 个语言文件到 {:?}",
+        "完成导出 {} 个语言文件到 {:?}",
         all_jsons.len(),
         output_dir
     ))
