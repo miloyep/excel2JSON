@@ -41,6 +41,14 @@ jobs:
             libgtk-3-dev libwebkit2gtk-4.1-dev \
             build-essential curl wget libayatana-appindicator3-dev librsvg2-dev
 
+      - name: Configure macOS universal build
+        if: matrix.platform == 'macos-latest'
+        run: |
+          echo "Enabling universal (arm64 + x64) macOS build"
+          # 自动写入 tauri.conf.json 设置
+          jq '.bundle.universal = true' src-tauri/tauri.conf.json > src-tauri/tauri.conf.tmp.json
+          mv src-tauri/tauri.conf.tmp.json src-tauri/tauri.conf.json
+
       - name: Build Tauri app
         run: pnpm tauri build
 
