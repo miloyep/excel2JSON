@@ -3,11 +3,14 @@ use chrono::{Duration as ChronoDuration, Local, NaiveDate};
 use indexmap::IndexMap;
 use json::JsonValue;
 use serde::Serialize;
-use serde_json::{json, Value};
-use std::fs;
+use serde_json::json;
+use std::fs::{self, File};
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use tauri::{AppHandle, Emitter};
+use walkdir::WalkDir;
+use zip::write::FileOptions;
+use zip::CompressionMethod;
 
 /// 日志类型
 #[derive(Serialize)]
@@ -158,6 +161,35 @@ fn get_cell_string(cell: &DataType) -> String {
     }
 }
 
+/// 压缩整个文件夹为 zip 文件
+fn zip_directory(src_dir: &Path, dst_file: &Path) -> Result<(), String> {
+    let file = File::create(dst_file).map_err(|e| format!("创建 zip 文件失败: {}", e))?;
+    let mut zip = zip::ZipWriter::new(file);
+    let options = FileOptions::default().compression_method(CompressionMethod::Deflated);
+
+    let base_path = src_dir.parent().unwrap_or_else(|| Path::new(""));
+
+    for entry in WalkDir::new(src_dir) {
+        let entry = entry.map_err(|e| format!("读取目录失败: {}", e))?;
+        let path = entry.path();
+
+        if path.is_file() {
+            // 计算相对路径（去掉上级目录）
+            let name = path.strip_prefix(base_path).unwrap();
+            let name_str = name.to_string_lossy();
+
+            let mut f = File::open(path).map_err(|e| format!("打开文件失败: {}", e))?;
+            zip.start_file(name_str, options)
+                .map_err(|e| format!("写入 zip 条目失败: {}", e))?;
+
+            std::io::copy(&mut f, &mut zip).map_err(|e| format!("写入 zip 内容失败: {}", e))?;
+        }
+    }
+
+    zip.finish().map_err(|e| format!("关闭 zip 失败: {}", e))?;
+    Ok(())
+}
+
 #[tauri::command]
 async fn convert_excel_to_json(app: AppHandle, path: String) -> Result<String, String> {
     send_progress(&app, &format!("开始处理文件: {}", path), LogType::Info)?;
@@ -174,7 +206,6 @@ async fn convert_excel_to_json(app: AppHandle, path: String) -> Result<String, S
         open_workbook(&file_path).map_err(|e| format!("打开文件失败: {}", e))?;
     send_progress(&app, "Excel 文件已成功打开", LogType::Success)?;
 
-    // 读取语言和 sheet 配置
     let lang_configs = read_language_configs_from_excel(&mut workbook)
         .map_err(|e| format!("读取语言配置失败: {}", e))?;
     let sheet_configs =
@@ -216,7 +247,6 @@ async fn convert_excel_to_json(app: AppHandle, path: String) -> Result<String, S
             LogType::Info,
         )?;
 
-        // 存储每个 sheet 的数据
         let mut sheet_data_map: IndexMap<String, IndexMap<String, String>> = IndexMap::new();
 
         for sheet_config in &sheet_configs {
@@ -242,14 +272,7 @@ async fn convert_excel_to_json(app: AppHandle, path: String) -> Result<String, S
 
             let header_row = match range.rows().next() {
                 Some(h) => h,
-                None => {
-                    send_progress(
-                        &app,
-                        &format!("⚠️ 工作表 '{}' 没有表头，跳过", sheet_config.name),
-                        LogType::Warning,
-                    )?;
-                    continue;
-                }
+                None => continue,
             };
 
             let lang_col = header_row
@@ -257,34 +280,23 @@ async fn convert_excel_to_json(app: AppHandle, path: String) -> Result<String, S
                 .position(|c| get_cell_string(c) == lang_config.code);
             let lang_col = match lang_col {
                 Some(c) => c,
-                None => {
-                    send_progress(
-                        &app,
-                        &format!(
-                            "⚠️ 工作表 '{}' 未找到语言列: {}",
-                            sheet_config.name, lang_config.code
-                        ),
-                        LogType::Warning,
-                    )?;
-                    continue;
-                }
+                None => continue,
             };
 
             let mut temp: IndexMap<String, String> = IndexMap::new();
 
             for (row_idx, row) in range.rows().enumerate().skip(1) {
-                let key = get_cell_string(&row[0]); // 保留原始 key
+                let key = get_cell_string(&row[0]);
                 if key.is_empty() {
                     continue;
                 }
 
                 let value = if row.len() > lang_col {
-                    get_cell_string(&row[lang_col]) // 保留原始值，包括空格
+                    get_cell_string(&row[lang_col])
                 } else {
                     String::new()
                 };
 
-                // 空值警告
                 if value.is_empty() {
                     send_progress(
                         &app,
@@ -318,18 +330,15 @@ async fn convert_excel_to_json(app: AppHandle, path: String) -> Result<String, S
             sheet_data_map.insert(sheet_config.name.clone(), temp);
         }
 
-        // 合并 sheet 数据到最终 JSON
+        // 合并 sheet 数据
         let mut final_json = JsonValue::new_object();
-
         for sheet_config in &sheet_configs {
             if let Some(temp) = sheet_data_map.get(&sheet_config.name) {
                 if sheet_config.sheet_type.as_deref() == Some("root") {
-                    // root sheet 平铺 key
                     for (k, v) in temp {
                         final_json[k] = v.clone().into();
                     }
                 } else {
-                    // 非 root sheet 保留 sheet 名称一级 key，保持 temp 顺序
                     let mut sheet_obj = JsonValue::new_object();
                     for (k, v) in temp {
                         sheet_obj[k] = v.clone().into();
@@ -339,30 +348,37 @@ async fn convert_excel_to_json(app: AppHandle, path: String) -> Result<String, S
             }
         }
 
-        // 写入 JSON 文件（漂亮缩进）
-        let json_str = final_json.pretty(2); // 两个空格缩进
+        // 写入文件
+        let json_str = final_json.pretty(2);
         let output_path = output_dir.join(format!("{}.json", lang_config.code));
         fs::write(&output_path, json_str).map_err(|e| e.to_string())?;
-
         send_progress(
             &app,
             &format!("✅ 已导出语言文件: {}", output_path.display()),
             LogType::Success,
         )?;
-
         all_jsons.push(output_path);
     }
 
+    // 压缩导出文件夹
+    let zip_path = output_dir.with_extension("zip");
+    send_progress(&app, "正在压缩导出文件夹...", LogType::Info)?;
+    zip_directory(&output_dir, &zip_path)?;
     send_progress(
         &app,
-        &format!("完成导出 {} 个语言文件到 {:?}", all_jsons.len(), output_dir),
+        &format!("✅ 已压缩文件夹为: {}", zip_path.display()),
         LogType::Success,
     )?;
 
+    // 删除原始文件夹
+    if let Err(e) = fs::remove_dir_all(&output_dir) {
+        send_progress(&app, &format!("⚠️ 删除文件夹失败: {}", e), LogType::Warning)?;
+    }
+
     Ok(format!(
-        "完成导出 {} 个语言文件到 {:?}",
+        "完成导出 {} 个语言文件并已压缩为 {:?}",
         all_jsons.len(),
-        output_dir
+        zip_path
     ))
 }
 
